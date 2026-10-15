@@ -52,12 +52,13 @@ export function DataProvider({ children }) {
 
   const derived = useMemo(() => (state.raw ? computeAll(state.raw) : null), [state.raw]);
 
-  /** Saves new contents for one or more collections as one undoable change. */
+  /** Saves new contents for one or more collections as one undoable change. Resolves false when nothing differs. */
   const save = useCallback(async (changes, label) => {
     const ops = diffOps(state.raw, changes);
-    if (!ops.length) throw new Error('Nothing changed.');
+    if (!ops.length) return false;
     await api.save(label, ops);
     await load();
+    return true;
   }, [state.raw, load]);
 
   const undo = useCallback(async (id) => {

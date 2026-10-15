@@ -19,6 +19,10 @@ export default function UpdatePanel({ onClose }) {
 
 const sum = (a, f) => a.reduce((s, r) => s + (r[f] ?? 0), 0);
 
+// Each card recognises the other card's report, so a file dropped in the wrong place gets a useful message.
+const isVacationReport = (tables) => tables.some((t) => (t[0] || []).some((h) => /vacation days|planned days off/i.test(String(h ?? ''))));
+const isFeesExport = (tables) => { try { parseFees(tables); return true; } catch { return false; } };
+
 function FeesCard({ onClose }) {
   const { raw, save } = useData();
   const fileRef = useRef(null);
@@ -54,7 +58,9 @@ function FeesCard({ onClose }) {
     const f = e.target.files[0]; if (!f) return;
     setMsg({ text: 'Reading ' + f.name + '…' });
     try {
-      const parsed = parseFees(await readTables(f));
+      const tables = await readTables(f);
+      if (isVacationReport(tables)) throw new Error(f.name + ' is the vacation-period report. Upload it in “Days off (vacation report)” below; this box takes the RAW FEES export.');
+      const parsed = parseFees(tables);
       setFees(parsed);
       setMsg({ text: 'Read ' + Object.keys(parsed.total).length + ' agents from ' + f.name + '. Check the summary, then save.' });
     } catch (err) { setMsg({ text: err.message || 'Couldn’t read that file.', bad: true }); }
@@ -69,8 +75,8 @@ function FeesCard({ onClose }) {
         .sort((a, b) => (a.date === b.date ? (a.collector < b.collector ? -1 : 1) : a.date < b.date ? -1 : 1));
       const changes = { snapshot_log: log };
       if (built.newTH) changes.team_history = built.newTH;
-      await save(changes, 'Update numbers for ' + d);
-      setMsg({ text: 'Saved. ' + d + ' is now on the dashboard for everyone.' });
+      const saved = await save(changes, 'Update numbers for ' + d);
+      setMsg({ text: saved ? 'Saved. ' + d + ' is now on the dashboard for everyone.' : 'Already up to date: the numbers for ' + d + ' are exactly what’s saved, so nothing changed.' });
       setFees(null); if (fileRef.current) fileRef.current.value = '';
     } catch (e) {
       setMsg({ text: 'Couldn’t save (' + e.message + '). Nothing was changed; try again.', bad: true });
@@ -128,7 +134,9 @@ function VacationCard() {
     const f = e.target.files[0]; if (!f) return;
     setMsg({ text: 'Reading ' + f.name + '…' });
     try {
-      setParsed(parseVacationReport(await readTables(f), f.name));
+      const tables = await readTables(f);
+      if (!isVacationReport(tables) && isFeesExport(tables)) throw new Error(f.name + ' is the RAW FEES export. Upload it in “Update numbers” above; this box takes the vacation-period report.');
+      setParsed(parseVacationReport(tables, f.name));
       setMsg({ text: 'Check the summary, then save.' });
     } catch (err) { setMsg({ text: err.message || 'Couldn’t read that file.', bad: true }); }
   };
@@ -138,11 +146,11 @@ function VacationCard() {
     const m = report.month;
     setSaving(true); setMsg({ text: 'Saving…' });
     try {
-      await save({
+      const saved = await save({
         vacation_days: raw.vacation_days.filter((d) => d.month !== m).concat(report.days),
         vacation_summary: raw.vacation_summary.filter((s) => s.month !== m).concat(report.summ),
       }, 'Days-off report for ' + m);
-      setMsg({ text: 'Saved. Days off for ' + m + ' are updated for everyone.' });
+      setMsg({ text: saved ? 'Saved. Days off for ' + m + ' are updated for everyone.' : 'Already up to date: this report matches the days off saved for ' + m + ', so nothing changed.' });
       setParsed(null); if (fileRef.current) fileRef.current.value = '';
     } catch (e) {
       setMsg({ text: 'Couldn’t save (' + e.message + '). Nothing was changed.', bad: true });
