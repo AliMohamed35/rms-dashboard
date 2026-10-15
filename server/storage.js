@@ -58,27 +58,42 @@ export function seedStorage(path, problem = 'no GitHub token or Blob store is co
 /**
  * db.json inside a GitHub repository. Reads use the raw contents API with ETags (a 304 is free and doesn't count
  * against the rate limit); each save is one commit, guarded by the file's blob SHA so concurrent saves can't
- * overwrite each other. If GitHub can't be reached or the token is wrong, the bundled db.json is served read-only
- * and `problem` says why.
+ * overwrite each other. With several tokens configured, the first one that can access the repo is used. If GitHub
+ * can't be reached or no token has access, the bundled db.json is served read-only and `problem` says why.
  */
-export function githubStorage(seedPath, { token, owner, repo, branch = 'main', path = 'db.json', apiBase = 'https://api.github.com' }) {
+export function githubStorage(seedPath, { token, tokens = [{ token, source: 'token' }], owner, repo, branch = 'main', path = 'db.json', apiBase = 'https://api.github.com' }) {
   const seed = seedStorage(seedPath);
   const url = `${apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
   const where = `${owner}/${repo} (${branch}:${path})`;
-  const headers = { Authorization: 'Bearer ' + token, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'rms-dashboard' };
+  const headersFor = (t) => ({ Authorization: 'Bearer ' + t.token, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'rms-dashboard' });
   const blobSha = (buf) => createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
-  let cache = null, sha = null, etag = null, recent = null;
+  const detail = async (res) => { try { return (await res.json()).message || ''; } catch { return ''; } };
+  let active = 0, cache = null, sha = null, etag = null, recent = null;
 
-  const explain = async (res, action) => {
-    let detail = '';
-    try { detail = (await res.json()).message || ''; } catch { /* no body */ }
-    if (res.status === 401) return 'GitHub rejected the token (401 Bad credentials). Check it hasn’t expired and is copied in full into the Vercel environment variable.';
-    if (res.status === 403 || res.status === 404) {
-      return action === 'write'
-        ? `the GitHub token can read ${where} but not write to it. In the fine-grained token settings give this repository "Contents: Read and write". (${res.status} ${detail})`
-        : `the GitHub token can’t read ${where}. Give the fine-grained token access to this repository with "Contents: Read and write". (${res.status} ${detail})`;
+  /** e.g. "GITHUB_TOKEN (…f3a9, GitHub account alice)": enough to identify a token without revealing it. */
+  const describe = async (t) => {
+    let who = '';
+    try {
+      const r = await fetch(apiBase + '/user', { headers: { ...headersFor(t), Accept: 'application/vnd.github+json' } });
+      who = r.ok ? ', GitHub account ' + (await r.json()).login : r.status === 401 ? ', rejected by GitHub as invalid or expired' : '';
+    } catch { /* offline */ }
+    return `${t.source} (…${t.token.slice(-4)}${who})`;
+  };
+
+  /** GET db.json with one token: { res } when usable, { missing } when the file isn't there yet, { fail } when the token has no access. */
+  const attempt = async (t, conditional) => {
+    const res = await fetch(url + '?ref=' + encodeURIComponent(branch), {
+      headers: { ...headersFor(t), Accept: 'application/vnd.github.raw+json', ...(conditional && etag && cache ? { 'If-None-Match': etag } : {}) },
+      cache: 'no-store',
+    });
+    if (res.ok || res.status === 304) return { res };
+    if (res.status === 404) {
+      // Either the file isn't on this branch yet (the first save creates it) or the token can't see the repo.
+      const repoRes = await fetch(`${apiBase}/repos/${owner}/${repo}`, { headers: { ...headersFor(t), Accept: 'application/vnd.github+json' } });
+      return repoRes.ok ? { missing: true } : { fail: repoRes.status + ' ' + (await detail(repoRes)) };
     }
-    return `GitHub answered ${res.status} ${detail}`.trim();
+    if (res.status === 401 || res.status === 403) return { fail: res.status + ' ' + (await detail(res)) };
+    return { error: `GitHub answered ${res.status} ${await detail(res)}`.trim() };
   };
 
   const self = {
@@ -86,28 +101,33 @@ export function githubStorage(seedPath, { token, owner, repo, branch = 'main', p
     writable: true,
     problem: null,
     async read() {
-      let res;
+      let out = null;
+      const failures = [];
       try {
-        res = await fetch(url + '?ref=' + encodeURIComponent(branch), {
-          headers: { ...headers, Accept: 'application/vnd.github.raw+json', ...(etag && cache ? { 'If-None-Match': etag } : {}) },
-          cache: 'no-store',
-        });
+        for (let i = 0; i < tokens.length && !out; i++) {
+          const idx = (active + i) % tokens.length;
+          const r = await attempt(tokens[idx], idx === active);
+          if (r.fail) { failures.push({ t: tokens[idx], why: r.fail.trim() }); continue; }
+          if (idx !== active) { active = idx; etag = null; }
+          out = r;
+        }
       } catch (e) {
         self.problem = 'can’t reach GitHub (' + e.message + ').';
         return cache ? structuredClone(cache) : seed.read();
       }
-      if (res.status === 304) { self.problem = null; return structuredClone(cache); }
-      if (res.status === 404) {
-        // Either the file isn't on this branch yet (the first save creates it) or the token can't see the repo.
-        const repoRes = await fetch(`${apiBase}/repos/${owner}/${repo}`, { headers: { ...headers, Accept: 'application/vnd.github+json' } });
-        if (repoRes.ok) { self.problem = null; sha = null; cache = await seed.read(); return structuredClone(cache); }
-        self.problem = await explain(repoRes, 'read');
+      if (!out) {
+        const tried = await Promise.all(failures.map(async (f) => (await describe(f.t)) + ': ' + f.why));
+        self.problem = `no GitHub token can read ${where}. Tried ${tried.join('; ')}. In the token’s settings on GitHub set Resource owner to ${owner}, `
+          + `add ${owner}/${repo} under Repository access, and set Contents to "Read and write".`;
         return seed.read();
       }
-      if (!res.ok) { self.problem = await explain(res, 'read'); return cache ? structuredClone(cache) : seed.read(); }
+      if (out.error) { self.problem = out.error; return cache ? structuredClone(cache) : seed.read(); }
+      self.problem = null;
+      if (out.missing) { sha = null; cache = await seed.read(); return structuredClone(cache); }
+      const res = out.res;
+      if (res.status === 304) return structuredClone(cache);
       const buf = Buffer.from(await res.arrayBuffer());
       const fetchedSha = blobSha(buf);
-      self.problem = null;
       // Right after our own save, GitHub may briefly still serve the previous version: keep ours.
       if (recent && fetchedSha !== recent.sha && Date.now() - recent.at < 15000) return structuredClone(cache);
       cache = JSON.parse(buf.toString('utf8')); sha = fetchedSha; etag = res.headers.get('etag');
@@ -115,14 +135,20 @@ export function githubStorage(seedPath, { token, owner, repo, branch = 'main', p
     },
     async write(state, label = 'Update data') {
       if (self.problem) throw Object.assign(new Error('Saving is turned off: ' + self.problem), { status: 503 });
+      const t = tokens[active];
       const text = JSON.stringify(state, null, 2) + '\n';
       const res = await fetch(url, {
         method: 'PUT',
-        headers: { ...headers, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+        headers: { ...headersFor(t), Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: 'Dashboard data: ' + label, content: Buffer.from(text, 'utf8').toString('base64'), branch, ...(sha ? { sha } : {}) }),
       });
       if (res.status === 409 || res.status === 422) { etag = null; throw new ConflictError(); }
-      if (!res.ok) throw Object.assign(new Error('Couldn’t save to GitHub: ' + (await explain(res, 'write'))), { status: 502 });
+      if (res.status === 401 || res.status === 403 || res.status === 404) {
+        const why = res.status + ' ' + (await detail(res));
+        throw Object.assign(new Error(`Couldn’t save to GitHub: the token ${await describe(t)} can read ${where} but not write to it. `
+          + `In the token’s settings on GitHub set Contents to "Read and write". (${why.trim()})`), { status: 502 });
+      }
+      if (!res.ok) throw Object.assign(new Error(`Couldn’t save to GitHub: ${res.status} ${await detail(res)}`.trim()), { status: 502 });
       const out = await res.json();
       sha = out.content?.sha ?? blobSha(Buffer.from(text, 'utf8'));
       cache = structuredClone(state); etag = null; recent = { sha, at: Date.now() };
