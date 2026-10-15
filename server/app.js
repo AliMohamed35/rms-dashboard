@@ -70,7 +70,13 @@ export async function createApp({ storage, adminToken = '' }) {
     next();
   });
 
-  api.get('/_meta', (_req, res) => res.json({ writable: storage.writable, auth: Boolean(adminToken) }));
+  // Reading first lets a misconfigured storage (e.g. a wrong GitHub token) report its problem.
+  api.get('/_meta', async (_req, res, next) => {
+    try {
+      await storage.read();
+      res.json({ writable: storage.writable && !storage.problem, auth: Boolean(adminToken), storage: storage.kind, problem: storage.problem || null });
+    } catch (e) { next(e); }
+  });
 
   api.get('/db', async (_req, res, next) => {
     try { res.json(publicState(await storage.read())); } catch (e) { next(e); }
@@ -90,7 +96,7 @@ export async function createApp({ storage, adminToken = '' }) {
         const inverse = applyOps(state, body.ops);
         const h = { id: 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: new Date().toISOString(), label, undo: inverse, undone: false };
         state.history = [...(state.history ?? []), h].slice(-HISTORY_LIMIT);
-        await storage.write(state);
+        await storage.write(state, label);
         return h;
       });
       res.status(201).json(summary(entry));
@@ -107,7 +113,7 @@ export async function createApp({ storage, adminToken = '' }) {
         if (body.id && body.id !== h.id) throw new HttpError(409, 'The last change is no longer "' + body.id + '". Reload the page and try again.');
         applyOps(state, h.undo);
         h.undone = true; h.undone_at = new Date().toISOString();
-        await storage.write(state);
+        await storage.write(state, 'Undo: ' + h.label);
         return h;
       });
       res.json(summary(done));

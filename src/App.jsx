@@ -85,6 +85,7 @@ export default function App() {
         {meta.writable && <UndoButton />}
       </Controls>
 
+      {!meta.writable && meta.problem && <Note className="text-warn!">Editing is turned off: {meta.problem}</Note>}
       {meta.writable && updateOpen && <UpdatePanel onClose={() => setUpdateOpen(false)} />}
 
       {page === 'mtd' && (

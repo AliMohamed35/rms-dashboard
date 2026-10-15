@@ -1,13 +1,17 @@
 // Vercel serverless function: the same json-server app as local dev, mounted at /api.
-// Data lives in Vercel Blob when a Blob store is connected (BLOB_READ_WRITE_TOKEN); otherwise the
-// bundled db.json is served read-only.
+// Vercel's filesystem is read-only, so db.json is stored in one of:
+//   1. the GitHub repo itself (a GitHub token is set): each save is a commit to db.json
+//   2. Vercel Blob (BLOB_READ_WRITE_TOKEN is set)
+//   3. nowhere: the bundled db.json is served read-only
 import path from 'node:path';
 import { createApp } from '../server/app.js';
-import { blobStorage, seedStorage } from '../server/storage.js';
+import { githubConfig } from '../server/config.js';
+import { blobStorage, githubStorage, seedStorage } from '../server/storage.js';
 
 const seed = path.join(process.cwd(), 'db.json');
-const storage = process.env.BLOB_READ_WRITE_TOKEN
-  ? blobStorage(seed, { access: process.env.BLOB_ACCESS === 'public' ? 'public' : 'private' })
+const gh = githubConfig(process.env);
+const storage = gh ? githubStorage(seed, gh)
+  : process.env.BLOB_READ_WRITE_TOKEN ? blobStorage(seed, { access: process.env.BLOB_ACCESS === 'public' ? 'public' : 'private' })
   : seedStorage(seed);
 const appPromise = createApp({ storage, adminToken: process.env.EDITOR_KEY || '' });
 

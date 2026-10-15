@@ -5,7 +5,16 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/index.js": { "includeFiles": "db.json", "maxDuration": 30 }
+    "api/index.js": {
+      "includeFiles": "db.json",
+      "maxDuration": 30
+    }
   },
-  "rewrites": [{ "source": "/api/:__path*", "destination": "/api" }]
+  "rewrites": [
+    {
+      "source": "/api/:__path*",
+      "destination": "/api"
+    }
+  ],
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- . ':(exclude)db.json'"
 }

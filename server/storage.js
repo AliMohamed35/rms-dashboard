@@ -1,8 +1,10 @@
 // Where db.json lives. json-server keeps the data in memory; a storage adapter loads it before
 // each request and persists it after each change.
-//   - fileStorage: the local db.json (development, or any host with a disk)
-//   - blobStorage: one private JSON file in Vercel Blob (Vercel's filesystem is read-only)
-//   - seedStorage: the bundled db.json, read-only (Vercel without a Blob store connected)
+//   - fileStorage:   the local db.json (development, or any host with a disk)
+//   - githubStorage: db.json in the GitHub repo, read and committed through the GitHub API (Vercel)
+//   - blobStorage:   one private JSON file in Vercel Blob (Vercel, alternative to GitHub)
+//   - seedStorage:   the bundled db.json, read-only (nothing configured)
+import { createHash } from 'node:crypto';
 import { readFile, writeFile, rename, stat } from 'node:fs/promises';
 
 export class ReadOnlyError extends Error {
@@ -22,7 +24,9 @@ export class ConflictError extends Error {
 export function fileStorage(path) {
   let cache = null, mtime = 0;
   return {
+    kind: 'file',
     writable: true,
+    problem: null,
     async read() {
       const s = await stat(path);
       if (!cache || s.mtimeMs !== mtime) { cache = JSON.parse(await readFile(path, 'utf8')); mtime = s.mtimeMs; }
@@ -37,10 +41,12 @@ export function fileStorage(path) {
   };
 }
 
-export function seedStorage(path) {
+export function seedStorage(path, problem = 'no GitHub token or Blob store is configured on this deployment.') {
   let cache = null;
   return {
+    kind: 'readonly',
     writable: false,
+    problem,
     async read() {
       cache ??= JSON.parse(await readFile(path, 'utf8'));
       return structuredClone(cache);
@@ -49,11 +55,89 @@ export function seedStorage(path) {
   };
 }
 
+/**
+ * db.json inside a GitHub repository. Reads use the raw contents API with ETags (a 304 is free and doesn't count
+ * against the rate limit); each save is one commit, guarded by the file's blob SHA so concurrent saves can't
+ * overwrite each other. If GitHub can't be reached or the token is wrong, the bundled db.json is served read-only
+ * and `problem` says why.
+ */
+export function githubStorage(seedPath, { token, owner, repo, branch = 'main', path = 'db.json', apiBase = 'https://api.github.com' }) {
+  const seed = seedStorage(seedPath);
+  const url = `${apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`;
+  const where = `${owner}/${repo} (${branch}:${path})`;
+  const headers = { Authorization: 'Bearer ' + token, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'rms-dashboard' };
+  const blobSha = (buf) => createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
+  let cache = null, sha = null, etag = null, recent = null;
+
+  const explain = async (res, action) => {
+    let detail = '';
+    try { detail = (await res.json()).message || ''; } catch { /* no body */ }
+    if (res.status === 401) return 'GitHub rejected the token (401 Bad credentials). Check it hasn’t expired and is copied in full into the Vercel environment variable.';
+    if (res.status === 403 || res.status === 404) {
+      return action === 'write'
+        ? `the GitHub token can read ${where} but not write to it. In the fine-grained token settings give this repository "Contents: Read and write". (${res.status} ${detail})`
+        : `the GitHub token can’t read ${where}. Give the fine-grained token access to this repository with "Contents: Read and write". (${res.status} ${detail})`;
+    }
+    return `GitHub answered ${res.status} ${detail}`.trim();
+  };
+
+  const self = {
+    kind: 'github',
+    writable: true,
+    problem: null,
+    async read() {
+      let res;
+      try {
+        res = await fetch(url + '?ref=' + encodeURIComponent(branch), {
+          headers: { ...headers, Accept: 'application/vnd.github.raw+json', ...(etag && cache ? { 'If-None-Match': etag } : {}) },
+          cache: 'no-store',
+        });
+      } catch (e) {
+        self.problem = 'can’t reach GitHub (' + e.message + ').';
+        return cache ? structuredClone(cache) : seed.read();
+      }
+      if (res.status === 304) { self.problem = null; return structuredClone(cache); }
+      if (res.status === 404) {
+        // Either the file isn't on this branch yet (the first save creates it) or the token can't see the repo.
+        const repoRes = await fetch(`${apiBase}/repos/${owner}/${repo}`, { headers: { ...headers, Accept: 'application/vnd.github+json' } });
+        if (repoRes.ok) { self.problem = null; sha = null; cache = await seed.read(); return structuredClone(cache); }
+        self.problem = await explain(repoRes, 'read');
+        return seed.read();
+      }
+      if (!res.ok) { self.problem = await explain(res, 'read'); return cache ? structuredClone(cache) : seed.read(); }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const fetchedSha = blobSha(buf);
+      self.problem = null;
+      // Right after our own save, GitHub may briefly still serve the previous version: keep ours.
+      if (recent && fetchedSha !== recent.sha && Date.now() - recent.at < 15000) return structuredClone(cache);
+      cache = JSON.parse(buf.toString('utf8')); sha = fetchedSha; etag = res.headers.get('etag');
+      return structuredClone(cache);
+    },
+    async write(state, label = 'Update data') {
+      if (self.problem) throw Object.assign(new Error('Saving is turned off: ' + self.problem), { status: 503 });
+      const text = JSON.stringify(state, null, 2) + '\n';
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: { ...headers, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Dashboard data: ' + label, content: Buffer.from(text, 'utf8').toString('base64'), branch, ...(sha ? { sha } : {}) }),
+      });
+      if (res.status === 409 || res.status === 422) { etag = null; throw new ConflictError(); }
+      if (!res.ok) throw Object.assign(new Error('Couldn’t save to GitHub: ' + (await explain(res, 'write'))), { status: 502 });
+      const out = await res.json();
+      sha = out.content?.sha ?? blobSha(Buffer.from(text, 'utf8'));
+      cache = structuredClone(state); etag = null; recent = { sha, at: Date.now() };
+    },
+  };
+  return self;
+}
+
 export function blobStorage(seedPath, { pathname = 'rms/db.json', access = 'private' } = {}) {
   let cache = null, etag = null;
   const seed = seedStorage(seedPath);
   return {
+    kind: 'blob',
     writable: true,
+    problem: null,
     async read() {
       const { get, BlobNotFoundError } = await import('@vercel/blob');
       // useCache:false reads from origin, so a save is visible on the next request from any instance.
